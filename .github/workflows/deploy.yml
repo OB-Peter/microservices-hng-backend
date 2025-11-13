@@ -4,7 +4,6 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,28 +16,36 @@ jobs:
       - name: Start services
         run: docker compose up -d
       
-      - name: Wait for services
-        run: sleep 15
+      - name: Wait for services to initialize
+        run: sleep 20
       
-      - name: Health check - API Gateway
-        run: |
-          curl -f http://localhost:8001/health || exit 1
+      - name: Check container status
+        run: docker compose ps
       
-      - name: Health check - User Service
+      - name: Health check with retries
         run: |
-          curl -f http://localhost:8002/health || exit 1
-      
-      - name: Health check - Email Service
-        run: |
-          curl -f http://localhost:8004/health || exit 1
-      
-      - name: Health check - Push Service
-        run: |
-          curl -f http://localhost:8005/health || exit 1
-      
-      - name: Health check - Template Service
-        run: |
-          curl -f http://localhost:8003/health || exit 1
+          services=("8001:api-gateway" "8002:user-service" "8004:email-service" "8005:push-service" "8003:template-service")
+          
+          for service in "${services[@]}"; do
+            port="${service%%:*}"
+            name="${service##*:}"
+            echo "Checking $name on port $port..."
+            
+            max_attempts=30
+            attempt=0
+            until curl -f http://localhost:$port/health 2>/dev/null || [ $attempt -eq $max_attempts ]; do
+              attempt=$((attempt + 1))
+              echo "Attempt $attempt/$max_attempts for $name..."
+              sleep 2
+            done
+            
+            if [ $attempt -eq $max_attempts ]; then
+              echo "❌ $name health check failed"
+              docker compose logs "$name" | tail -50
+              exit 1
+            fi
+            echo "✅ $name is healthy"
+          done
       
       - name: Test notification API
         run: |
@@ -53,7 +60,7 @@ jobs:
       
       - name: Cleanup
         run: docker compose down
-
+  
   build:
     needs: test
     runs-on: ubuntu-latest
@@ -105,7 +112,7 @@ jobs:
           context: ./template-service
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/notification-template-service:latest
-
+  
   deploy:
     needs: build
     runs-on: ubuntu-latest
