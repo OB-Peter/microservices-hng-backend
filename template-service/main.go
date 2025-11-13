@@ -14,12 +14,12 @@ import (
 )
 
 type Template struct {
-	ID        int       `json:"id"`
-	Name      string    `json:"name"`
-	Type      string    `json:"type"` // email, push
-	Subject   string    `json:"subject"`
-	Body      string    `json:"body"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int       `json:"id" db:"id"`
+	Name      string    `json:"name" db:"name"`
+	Type      string    `json:"type" db:"type"`
+	Subject   string    `json:"subject" db:"subject"`
+	Body      string    `json:"body" db:"body"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
 type CreateTemplateRequest struct {
@@ -73,8 +73,17 @@ func main() {
 }
 
 func initSchema() {
+	// Drop table first to ensure clean schema (safe for CI/CD and development)
+	// In production, you'd use proper migrations instead
+	dropSchema := `DROP TABLE IF EXISTS templates;`
+	_, err := db.Exec(dropSchema)
+	if err != nil {
+		log.Println("Warning: Could not drop table:", err)
+	}
+
+	// Create table with correct schema
 	schema := `
-	CREATE TABLE IF NOT EXISTS templates (
+	CREATE TABLE templates (
 		id SERIAL PRIMARY KEY,
 		name VARCHAR(255) UNIQUE NOT NULL,
 		type VARCHAR(50) NOT NULL,
@@ -90,7 +99,7 @@ func initSchema() {
 	('order_confirmation', 'push', 'Order Confirmed', 'Your order #{{order_id}} has been confirmed!')
 	ON CONFLICT (name) DO NOTHING;
 	`
-	_, err := db.Exec(schema)
+	_, err = db.Exec(schema)
 	if err != nil {
 		log.Fatal("Failed to create schema:", err)
 	}
