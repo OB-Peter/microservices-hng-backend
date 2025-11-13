@@ -1,214 +1,146 @@
-
-
-services:
-  # ============================================
-  # INFRASTRUCTURE SERVICES (Start First)
-  # ============================================
+name: Deploy Notification System
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Clean up old containers and volumes
+        run: docker compose down -v
+      
+      - name: Start services
+        run: docker compose up -d --build
+      
+      - name: Wait for services to initialize
+        run: sleep 25
+      
+      - name: Check container status
+        run: docker compose ps
+      
+      - name: Health check with retries
+        run: |
+          services=("8001:api-gateway" "8002:user-service" "8004:email-service" "8005:push-service" "8003:template-service")
+          
+          for service in "${services[@]}"; do
+            port="${service%%:*}"
+            name="${service##*:}"
+            echo "Checking $name on port $port..."
+            
+            max_attempts=30
+            attempt=0
+            until curl -f http://localhost:$port/health 2>/dev/null || [ $attempt -eq $max_attempts ]; do
+              attempt=$((attempt + 1))
+              echo "Attempt $attempt/$max_attempts for $name..."
+              sleep 2
+            done
+            
+            if [ $attempt -eq $max_attempts ]; then
+              echo "❌ $name health check failed"
+              docker compose logs "$name" | tail -50
+              exit 1
+            fi
+            echo "✅ $name is healthy"
+          done
+      
+      - name: Test notification API
+        run: |
+          response=$(curl -X POST http://localhost:8001/notifications \
+            -H "Content-Type: application/json" \
+            -d '{"user_id":"test","type":"email","title":"CI Test","message":"Testing"}')
+          echo $response | grep -q "success" || exit 1
+      
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+      
+      - name: Cleanup
+        run: docker compose down
   
-  rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    container_name: rabbitmq_server
-    ports:
-      - "5673:5672"      # AMQP port (for services)
-      - "15673:15672"    # Management UI (http://localhost:15673)
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - notification_network
-
-  postgres_user_db:
-    image: postgres:15-alpine
-    container_name: postgres_user_service
-    ports:
-      - "5434:5432"
-    environment:
-      POSTGRES_DB: user_service_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
-    volumes:
-      - postgres_user_data:/var/lib/postgresql/data
-      - ./init-scripts/01-user-service.sql:/docker-entrypoint-initdb.d/01-init.sql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - notification_network
-
-  postgres_template_db:
-    image: postgres:15-alpine
-    container_name: postgres_template_service
-    ports:
-      - "5433:5432"
-    environment:
-      POSTGRES_DB: template_service_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
-    volumes:
-      - postgres_template_data:/var/lib/postgresql/data
-      - ./init-scripts/02-template-service.sql:/docker-entrypoint-initdb.d/01-init.sql
-      - ./init-scripts/03-notification-status.sql:/docker-entrypoint-initdb.d/02-init.sql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - notification_network
-
-  redis:
-    image: redis:7-alpine
-    container_name: redis_cache
-    ports:
-      - "6380:6379"
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - notification_network
-
-  # ============================================
-  # MICROSERVICES (Start After Infrastructure)
-  # ============================================
-
-  api-gateway:
-    build:
-      context: ./api-gateway
-      dockerfile: Dockerfile
-    container_name: api_gateway_service
-    ports:
-      - "8001:8001"
-    environment:
-      PORT: 8001
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      REDIS_URL: redis://redis:6379
-      USER_SERVICE_URL: http://user-service:8002
-      TEMPLATE_SERVICE_URL: http://template-service:8003
-      LOG_LEVEL: debug
-      JWT_SECRET: your_jwt_secret_key_here
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - notification_network
-    restart: unless-stopped
-
-  user-service:
-    build:
-      context: ./user-service
-      dockerfile: Dockerfile
-    container_name: user_service
-    ports:
-      - "8002:8002"
-    environment:
-      PORT: 8002
-      DB_HOST: postgres_user_db
-      DB_PORT: 5432
-      DB_NAME: user_service_db
-      DB_USER: postgres
-      DB_PASSWORD: postgres123
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: debug
-    depends_on:
-      postgres_user_db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - notification_network
-    restart: unless-stopped
-
-  template-service:
-    build:
-      context: ./template-service
-      dockerfile: Dockerfile
-    container_name: template_service
-    ports:
-      - "8003:8003"
-    environment:
-      PORT: 8003
-      DB_HOST: postgres_template_db
-      DB_PORT: 5432
-      DB_NAME: template_service_db
-      DB_USER: postgres
-      DB_PASSWORD: postgres123
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: debug
-    depends_on:
-      postgres_template_db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - notification_network
-    restart: unless-stopped
-
-  email-service:
-    build:
-      context: ./email-service
-      dockerfile: Dockerfile
-    container_name: email_service
-    ports:
-      - "8004:8004"
-    environment:
-      PORT: 8004
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      REDIS_URL: redis://redis:6379
-      SMTP_HOST: smtp.gmail.com
-      SMTP_PORT: 587
-      SMTP_USER: your_email@gmail.com
-      SMTP_PASSWORD: your_app_password
-      LOG_LEVEL: debug
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - notification_network
-    restart: unless-stopped
-
-  push-service:
-    build:
-      context: ./push-service
-      dockerfile: Dockerfile
-    container_name: push_service
-    ports:
-      - "8005:8005"
-    environment:
-      PORT: 8005
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      REDIS_URL: redis://redis:6379
-      FCM_API_KEY: your_fcm_api_key_here
-      LOG_LEVEL: debug
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - notification_network
-    restart: unless-stopped
-
-networks:
-  notification_network:
-    driver: bridge
-
-volumes:
-  postgres_user_data:
-  postgres_template_data:
-  redis_data:
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Build and push API Gateway
+        uses: docker/build-push-action@v4
+        with:
+          context: ./api-gateway
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/notification-api-gateway:latest
+      
+      - name: Build and push User Service
+        uses: docker/build-push-action@v4
+        with:
+          context: ./user-service
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/notification-user-service:latest
+      
+      - name: Build and push Email Service
+        uses: docker/build-push-action@v4
+        with:
+          context: ./email-service
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/notification-email-service:latest
+      
+      - name: Build and push Push Service
+        uses: docker/build-push-action@v4
+        with:
+          context: ./push-service
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/notification-push-service:latest
+      
+      - name: Build and push Template Service
+        uses: docker/build-push-action@v4
+        with:
+          context: ./template-service
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/notification-template-service:latest
+  
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Deploy to server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /opt/notification-system
+            git pull origin main
+            docker compose pull
+            docker compose up -d --remove-orphans
+            docker system prune -f
+            
+            # Wait for services to be healthy
+            sleep 10
+            
+            # Health checks
+            curl -f http://localhost:8001/health || exit 1
+            
+            echo "Deployment successful!"
